@@ -1,0 +1,279 @@
+---
+title: "Applied Multiple Training & Test (Chaturvedi 2014)"
+author: "Brandon Hoeft"
+date: "February 6, 2016"
+output: html_document
+---
+  
+  
+#### Introduction
+
+In this analysis, I used the GermanCredit dataset available in the caret package to model the Amount of loan for each customer, regressed on a subset of different predictors using Ordinary Least Squares (OLS) with the lm() function in R. There are no missing values from this dataset, so limited data pre-processing was required for this analysis. The goal of this analysis is to investigate a different statistical resampling method, known as multiple train and test, or MUTATE (Chaturvedi 2014).   
+
+MUTATE is an alternative model estimation sampling procedure, devised by Dr. Anil Chaturvedi, to balance the bias-variance tradeoff of prediction accuracy for supervised models. It can be applied under the same circumstances one would apply other validation or cross-validation procedures to estimate out-of-sample predictive accuracy. 
+
+Unlike the single model validation method, which requires a single split training and validation data sample, MUTATE requires iterative resampling of the full dataset into different random training and testing samples many times. In each sample, the identical model form is re-fit and  model's performance on testing data is measured through each iteration. MUTATE provides a sampling distribution of whatever measurements we wish to take from a specified model: coefficients, their variance, accuracy metrics of many kinds. It is more robust than a single validation test set, which can be highly variable on a single split because of the inherent randomness of records that are distributed between a single training and validation data set. Further, MUTATE better balances the bias-variance tradeoff versus computationally expensive and more biased re-sampling methods like Leave-One-Out Cross-Validation (LOOCV). 
+
+This analysis will evaluate how the selected linear model performs during the MUTATE procedure and how it compares against fitting the same model to the full GermanCredit dataset. 
+
+####  Exploratory Variable Selection
+
+There are about 60 different predictors that could be evaluated in a linear model to try to predict the target variable, Amount of the loan outstanding. 
+
+```{r warning=FALSE, message=FALSE}
+library(caret)
+
+data("GermanCredit") # dataset in caret
+credit <- data.frame(GermanCredit) # target = Amount
+dim(credit)
+```
+
+Since the goal is to evaluate the procedure and not necessarily fit the best model, I used decision trees and LASSO regression to help perform variable selection. For decision trees, I used a simple 70:30 validation splitting procedure to evaluate the predictive accuracy on the holdout sample data. 
+
+```{r warning=FALSE, message=FALSE}
+library(rpart) # decision trees
+library(glmnet) # for LASSO
+
+set.seed(82510)
+train.tree.index <- sample(nrow(credit), size = round(0.70 * nrow(credit)))
+credit.train <- credit[train.tree.index, ]
+credit.holdout <- credit[-train.tree.index, ] 
+tree <- rpart(Amount ~., data = credit.train, method = "anova")
+tree.pred <- predict(tree, newdata = credit.holdout)
+# Calculate residual standard error in holdout sample
+sqrt(mean((credit.holdout$Amount - tree.pred)^2)) 
+```
+
+The rpart() method stores variable importance values for different predictors. I analyzed the top 10 predictors in the model using this rpart object, rescaling each predictor's importance so that the importance of all predictors sums to 1. The top 10 predictors in the decision tree are displayed.
+
+```{r }
+# extracted predictor importance values from rpart output.scaled to be proportion of 1
+pred.importance <- round(tree$variable.importance / sum(tree$variable.importance), 2)
+pred.importance[1:10]
+
+```
+
+For LASSO regression, which shrinks some of the predictor coefficients down to 0 based on the largeness of the lambda tuning parameter, effectively performs subset variable selection. I applied 10-fold cross-validation on 70% training dataset. This was done to find the best lambda value that yielded the lowest cross-validated mean squared error averaged over the 10-folds. 
+
+```{r warning=FALSE, message=FALSE}
+library(glmnet) # for LASSO
+
+# set grid of lambda tuning parameter values to evaluate
+grid <- 10 ^ seq(from = 10, to = -2, length = 100) 
+
+# set x matrix, y vector
+x <- model.matrix(Amount~., data = credit)[, -2]
+y <- credit$Amount
+
+# train and test indices
+set.seed(82510)
+train <- sample(nrow(x), size =  round(0.70 * nrow(x)))
+y.test <- y[-train]
+
+# automatically standardizes variables. alpha = 1 argument is to ensure LASSO method
+# use 10-fold cv on the training dataset, measuring performance for every lambda value.
+set.seed(82510) # reproducible 10-fold
+lasso.cv <- cv.glmnet(x[train, ], y[train], alpha = 1, lambda = grid)
+plot(lasso.cv)
+bestlam <- lasso.cv$lambda.min
+bestlam
+```
+
+75.6 is the tuning parameter that yielded the lowest cross-validated average MSE. This LASSO model with the optimal tuning parameter identified in cross-validation, left 29 variables with nonzero coefficients. The model was applied to the 30% test data set to measure its predictive accuracy on unseen data. However, it appears the tree model outperformed LASSO regression.
+
+```{r warning=FALSE, message=FALSE}
+# predict Mean Squared Error on test data using the bestlam tuning parameter model.
+lasso.pred <- predict(object = lasso.cv, s = bestlam, newx = x[-train, ])
+# residual standard error on 30% validation data from LASSO model
+sqrt(mean((y.test - lasso.pred)^2)) 
+
+```
+
+The decision trees yielded a residual standard error (RSE) of $2,210 on the validation data set. The LASSO model with optimal tuning parameter yielded an RSE of $2,467, an 11.6% higher error rate in the value of the predicted Amount than the decision trees. 
+
+As a result, I decided to use 4 of the most important predictors identified from the decision trees to fit a multiple linear regression using the MUTATE method described in the introduction. 4 predictors were chosen for simplicity of completing this analysis.
+
+```{r warning=FALSE, message=FALSE, echo = FALSE}
+names(pred.importance[c(1,2,3,5)])
+```
+  
+#### MUTATE Procedure with Selected Predictors
+
+The code that follows below runs the MUTATE method and stores the statistics of interest from each 1,000 randomly sampled iterations of the model fitting and assessment process.
+
+For the MUTATE method, I split the credit data randomly into a 90:10 training vs validation split. The target variable, Amount, was regressed on the 4 predictor variables using the 90% training data. The R-squared value was then computed on the 10% validation holdout data set. Fitted model coefficients and R-Squared values from training and holdout samples were saved after each model iteration. These steps were repeated 1,000 times, yielding a sample distribution of statistics for further analysis. A set.seed() function was applied within each iteration of the for() loop code that follows to allow for possible reproducibility of this analysis.  
+
+```{r warning=FALSE, message=FALSE}
+# MuTaTe code.
+# using credit dataset in caret package, previously loaded.
+# initiate empty vectors to collect values.
+intercept <- c()
+Duration <- c()
+Job.Management.SelfEmp.HighlyQualified <- c()
+InstallmentRatePercentage <- c()
+Purpose.UsedCar <- c()
+rsquared.train <- c()
+rsquared.holdout <- c()  
+
+# create 1000 separate OLS fits using different 90/10 training/validation sets.
+for (i in 1: 1000) {
+  
+  # create reproducible, randomly sampled training vs validation data.
+  set.seed(i + 1)
+  indices <- sample(nrow(credit), size = round(0.90 * nrow(credit)))
+  data.train <- credit[indices, ]
+  data.holdout <- credit[-indices, ] 
+  
+  # linear regression model fit with training data. Predictors chosen from prior EDA models.
+  model.fit <- lm(Amount ~ Duration + Job.Management.SelfEmp.HighlyQualified + 
+                 InstallmentRatePercentage + Purpose.UsedCar , data = data.train)
+  
+  # capture fitted coefficient values.
+  coeff <- coefficients(model.fit)
+  
+  intercept[i] <- coeff[1]
+  Duration[i] <- coeff[2]
+  Job.Management.SelfEmp.HighlyQualified[i] <- coeff[3]
+  InstallmentRatePercentage[i] <- coeff[4]
+  Purpose.UsedCar[i] <- coeff[5]
+  
+  # R-squared from training
+  rsquared.train[i] <- summary(model.fit)$r.squared
+  
+  # predict model.fit on unseen validation data set, store predictions.
+  predicted.amount <- predict(model.fit, newdata = data.holdout)
+  # calculate the r-squared on holdout data.
+  # square the correlation between actual vs predicted amount.
+  rsquared.holdout[i] <- cor(data.holdout$Amount, predicted.amount)^2
+  
+}   
+
+# tidy results into a data frame.
+mutate.results <- data.frame(model_number = rep(1:1000), rsquared.train, rsquared.holdout,intercept, 
+                             Duration, Job.Management.SelfEmp.HighlyQualified, 
+                             InstallmentRatePercentage, Purpose.UsedCar)
+
+
+# dplyr to generate summary stats about sampling distributions.
+library(dplyr)
+mutate.stats <- mutate.results %>%
+  summarise(intercept.mean.coef = mean(intercept),
+            intercept.sd.coef = sd(intercept),
+            Duration.mean.coef = mean(Duration),
+            Duration.sd.coef = sd(Duration),
+            Job.Management.SelfEmp.HighlyQualified.mean.coef = mean(Job.Management.SelfEmp.HighlyQualified),
+            Job.Management.SelfEmp.HighlyQualified.sd.coef = sd(Job.Management.SelfEmp.HighlyQualified),
+            InstallmentRatePercentage.mean.coef = mean(InstallmentRatePercentage),
+            InstallmentRatePercentage.sd.coef = sd(InstallmentRatePercentage),
+            Purpose.UsedCar.mean.coef = mean(Purpose.UsedCar),
+            Purpose.UsedCar.sd.coef = sd(Purpose.UsedCar),
+            rsquared.train.mean = mean(rsquared.train),
+            rsquared.train.sd = sd(rsquared.train),
+            rsquared.holdout.mean = mean(rsquared.holdout),
+            rsquared.holdout.sd = sd(rsquared.holdout),
+            rsquared.difference.mean = mean(rsquared.holdout.mean - rsquared.train.mean)
+            )
+
+```
+  
+#### MUTATE Regression Coefficient Sampling Distributions
+
+The 5 graphs below show the sample distributions of all 5 parameter coefficients (including the intercept) from 1,000 re-sampled linear model fits of the same form. The blue dotted line represents the mean coefficient value across the 1,000 validation resamplings of the GermanCredit data set. The summary statistics are provided towards the end of this analysis to compare against the model fitted to the full GermanCredit data set. 
+
+```{r warning=FALSE, message=FALSE, echo = FALSE, fig.width = 10, fig.height = 10}
+
+par(mfrow = c(3,2))
+
+# distribution of intercept.
+hist(mutate.results$intercept, col = "grey", xlab = "Intercept",
+     main = paste("Coefficient Distribution of", "Intercept"))
+abline(v = mutate.stats$intercept.mean.coef, lty = "dashed", lwd = "3", col = "blue")  
+
+# distribution of duration predictor coef.
+hist(mutate.results$Duration, col = "grey", main = paste("Coefficient Distribution of", "Duration"),
+     xlab = "Duration")
+abline(v = mutate.stats$Duration.mean.coef, lty = "dashed", lwd = "3", col = "blue")  
+
+# distribution of Job.Management.SelfEmp.HighlyQualified predictor coef.
+hist(mutate.results$Job.Management.SelfEmp.HighlyQualified, col = "grey",
+     main = paste("Coefficient Distribution of", "Job.Management.SelfEmp.HighlyQualified"),
+     xlab = "Job.Management.SelfEmp.HighlyQualified")
+abline(v = mutate.stats$Job.Management.SelfEmp.HighlyQualified.mean.coef, 
+       lty = "dashed", lwd = "3", col = "blue")  
+
+# distribution of InstallmentRatePercentage predictor coef.  
+hist(mutate.results$InstallmentRatePercentage, col = "grey",
+     main = paste("Coefficient Distribution of", "InstallmentRatePercentage"),
+     xlab = "InstallmentRatePercentage")
+abline(v = mutate.stats$InstallmentRatePercentage.mean.coef, lty = "dashed", lwd = "3", 
+       col = "blue")  
+
+# distribution of Purpose.UsedCar  predictor coef. 
+hist(mutate.results$Purpose.UsedCar, col = "grey",
+     main = paste("Coefficient Distribution of", "Purpose.UsedCar"), xlab = "Purpose.UsedCar")
+abline(v = mutate.stats$Purpose.UsedCar.mean.coef, lty = "dashed", lwd = "3", 
+       col = "blue") 
+
+```
+  
+#### MUTATE Predictive Accuracy Sampling Distributions
+
+The next 2 graphs analyze performance of the model on 1,000 samples of unseen data, the 10% validation data set from each iteration of MUTATE procedure. The first graph illustrates the distribution of the R-squared value from the validation data. R-squared is a measurement of the variability in the target variable that is explained by the 4 predictor variables. The second graph shows the percentage decline in R-squared between the training data and the R-squared in the validation data. A sign of an overfit model, or a model with very low bias that might not generalize to new data well is a steep decline in R-squared performance in validation relative to training R-squared.  These graphs illustrate that the form of this specific 4-variable regression model does not appear to overfit the training data, in the average fitted model from the MUTATE procedure, as the average decrease in R-squared in the validation set after 1,000 model train and validation iterations is centered around 0, although some fat tails are displayed showing some unusually high and low R-squared values in a few samples. Additionally the training model seems to perform relatively well on the validation data, with a mean R-Squared of 0.56 on the unseen validation data with a standard deviation of 0.07. 
+
+
+```{r warning=FALSE, message=FALSE, echo = FALSE, fig.width = 10, fig.height = 10}
+
+par(mfrow = c(2,1))
+# distribution of holdout Rsquared.
+hist(mutate.results$rsquared.holdout, xlab = "R-Squared Holdout", col = "grey",
+     main = "Distribution of R-Squared values from Holdout Data")
+abline(v = mutate.stats$rsquared.holdout.mean, lty = "dashed", lwd = "3", col = "blue")  
+
+
+# distribution of % Decrease in holdout Rsquared distribution.
+hist(mutate.results$rsquared.holdout - mutate.results$rsquared.train, xlab = "R-Squared % Decrease",
+     col = "grey", main = "Distribution of R-Squared % Decrease in Holdout")
+abline(v = mutate.stats$rsquared.difference.mean, lty = "dashed", lwd = "3", col = "blue")  
+```
+  
+#### Compare MUTATE to Full Model Fit
+
+In the proceeding output, the object reshape.coef.stats is a dataframe housing summary statistics about the mean coefficient estimates collected from each 1,000 model fits in the MUTATE procedure. These statistics can be compared against the values from the fully fit model.
+
+```{r warning=FALSE, message=FALSE}
+# rbind the coefficient mean and standard deviation from MuTaTe method collected previously
+coef.means <- rbind(mutate.stats[, c(1,3,5,7,9)])
+coef.sd <- rbind(mutate.stats[, c(2,4,6,8,10)])
+
+# shape the summary data from MuTaTe into a tidy, long-form data frame
+reshape.coef.stats <- data.frame(coefficient = c("intercept", "Duration", 
+                                           "Job.Management.SelfEmp.HighlyQualified", 
+                                           "InstallmentRatePercentage",
+                                           "Purpose.UsedCar"),
+                           coef.means = as.numeric(coef.means), coef.sd = as.numeric(coef.sd))
+reshape.coef.stats
+
+# Full Model Fit on all 1,000 records
+full.lmfit <- lm(Amount ~ Duration + Job.Management.SelfEmp.HighlyQualified + 
+                   InstallmentRatePercentage + Purpose.UsedCar, data = credit)
+
+# coefficient estimates and standard errors from full model fit
+coef(summary(full.lmfit))
+
+```
+
+From the comparison of the sample summary statistics from the MUTATE method versus the coefficient estimates and standard errors from the fully fitted linaer model, it is clear that the average coefficient estimate from 1,000 models trained on different 90% data samples is almost identical to the full model. The standard deviation of the coefficients from the 1,000 sample models is smaller but similar to the standard errors of the coefficients from the single full model.  
+  
+#### Conclusion
+
+Some additional takeaways that come to my mind from applying Dr. Chaturvedi's MUTATE re-sampling method with the GermanCredit data set:
+
+1) MUTATE's random resampling process yields approximately normal sampling distributions because the random variables generated from the many random samples are independent and identically distributed, which is key attribute of the central limit theorem.  
+
+2) MUTATE with regards to coefficient estimation is an empirical simulation of the inference we obtain from analyzing the standard errors, t-statistics, and p-values for the coefficient effect in a single model. The skewness and kurtosis of the distributions from MUTATE can empirically give us insight into the quality of model fit from many samples. 
+
+3) The 2 histograms pertaining to validation R-squared from the MUTATE procedure show that on a given single training-validation split sampling of the data, the coefficients and predictive accuracy can vary tremendously on any 1 sample (i.e. the distribution tails). A single validation set analysis might show far worse or far better predictive accuracy of a model from only one sample than is most likely. If that single model has predictive accuracy values closer to either tail of these R-squared histograms, we might lead to a wrong conclusion. To get a better idea of the true variation of the model's predictive performance take many resamplings of the full data set for training and validating the model. There is strength in many samples. This leads to better insight into the variance of our model's predictive power.    
+
+4) After selecting an optimal model, identified through some re-sampling method that yields the best predictive accuracy, it is best practice to train the final model to the full dataset we started with because it will provide tighter, accurate coefficient estimates with more data. Doing so should not bias or result in wildly different coefficients obtained from a re-sampling estimation procedure.
+
+
